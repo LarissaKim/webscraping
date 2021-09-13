@@ -1,63 +1,83 @@
+from dateutil import parser
 import re
+from time import strftime
+from urllib.request import urlopen
 
 from bs4 import BeautifulSoup
 import pandas as pd
-from urllib.request import urlopen
 
-# URL for Steam's Oculus Rift VR category
+# URL for Steam's Oculus Rift VR category sorted by relevance (default)
+# Page loads 50 results (Note: This code can't handle recently released
+# games with no reviews, yet)
 html = urlopen('https://store.steampowered.com/search/?vrsupport=102').read()
 bs = BeautifulSoup(html, 'html.parser')
 
-titles = [title.get_text() for title in bs.findAll("span",
-                                                   {"class": "title"})]
+app_titles = [title.get_text() for title in bs.findAll("span",
+                                                       {"class": "title"})]
 
-release_dates = [date.get_text()
-                 for date in bs.findAll(
-            "div", {"class": "col search_released responsive_secondrow"})]
+dates = [date.get_text() for date in bs.findAll(
+        "div", {"class": "search_released"})]
+dates = [parser.parse(date) for date in dates]
 
-app_prices = bs.findAll(
-        "div", {"class":
-                    ["col search_price responsive_secondrow",
-                     "col search_price discounted responsive_secondrow"]})
-for price in app_prices:
-    # Remove the non-sale price of an app if it is on sale
-    for strike in price.select("strike"):
+prices = []
+app_prices = bs.findAll("div", {"class": "search_price"})
+for app_price in app_prices:
+    # Remove the struck-out regular price of an app if it is on sale
+    # Must be done before get_text() so each app has one price only
+    for strike in app_price.select("strike"):
         strike.extract()
-prices = [price.get_text() for price in app_prices]
-# Remove unnecessary whitespace from string
-prices = [(re.sub(r"^\s+|\s+$", '', price)) for price in prices]
+    app_price = app_price.get_text()
+    # Remove price formatting
+    app_price = re.sub(r"[CDN$]", '', app_price)
+    # Remove unnecessary whitespace from price string
+    app_price = re.sub(r"^\s+|\s+$", '', app_price)
+    prices.append(app_price)
 
-discounts = [discount.get_text()
-             for discount in bs.findAll("div",
-                                        {"class": "col search_discount "
-                                                  "responsive_secondrow"})]
-# Remove unnecessary whitespace from string
-discounts = [(re.sub(r"[^(?:\-\d+%)]", '', discount))
-             for discount in discounts]
+discount_percentages = [discount.get_text() for discount in bs.findAll(
+        "div", {"class": "search_discount"})]
+# Remove unnecessary whitespace from discount string
+discount_percentages = [(re.sub(r"[^(?:\d+)]", '', discount))
+                        for discount in discount_percentages]
 
+# This section (review_summaries, num_reviews, positive_percentages) will
+# need to be updated to handle recently released games with no reviews
 review_summary_container = bs.findAll("span",
                                       {"class": "search_review_summary"})
 review_summaries = [summary.get('data-tooltip-html')
                     for summary in review_summary_container]
-# Only keep user review rating level (happens before <br>)
-review_summaries = [(re.findall(r"(.*?)(?=<)", summary)[0])
-                    for summary in review_summaries]
+# Extract review count
+num_reviews = []
+for review_count in review_summaries:
+    review_count = re.findall(r"(?:\d+,\d+|\d+)[^\d+%]", review_count)[0]
+    review_count = re.sub(r"^\s+|\s+$", '', review_count)
+    num_reviews.append(review_count)
+# Extract positive review percentages
+positive_percentages = [(re.findall(r"(?:\d+)", summary)[0]) for summary in
+                        review_summaries]
 
-# Get only app links
-links = [link.get("href")
-         for link in bs.find('div', {'id': 'search_resultsRows'})
-             .find_all('a', {'href': re.compile(r'(.com/app/\d+/)')})]
+app_links = [link.get("href")
+             for link in bs.find('div', {'id': 'search_resultsRows'})
+                 .find_all('a', {'href': re.compile(r'(.com/app/\d+/)')})]
 
-output = []
-for info in zip(titles, release_dates, prices,
-                discounts, review_summaries, links):
-    resp = {'title': info[0],
-            'release_date': info[1],
-            'price': info[2],
-            'discount': info[3],
-            'review_summary': info[4],
-            'link': info[5]}
-    output.append(resp)
+apps = pd.DataFrame({
+    'title': app_titles,
+    'release_date (yyyy-mm-dd)': dates,
+    'price ($CDN)': prices,
+    'discount (%)': discount_percentages,
+    'review_count': num_reviews,
+    'positive_reviews (%)': positive_percentages,
+    'link': app_links
+    })
 
-df = pd.DataFrame(output)
-df.to_excel('steam_scrape.xlsx')
+# Data cleanup
+# Price value errors ignored - 'Free' and 'Free to Play' are significant values
+apps['release_date (yyyy-mm-dd)'] = pd.to_datetime(
+        apps['release_date (''yyyy-mm-dd)'],
+        format="%Y-%m-%d", errors='ignore')
+apps['price ($CDN)'] = pd.to_numeric(apps['price ($CDN)'], errors='ignore')
+apps['discount (%)'] = pd.to_numeric(apps['discount (%)'], errors='coerce') \
+    .astype('Int64')
+apps['review_count'] = apps['review_count'].str.replace(',', '').astype(int)
+apps['positive_reviews (%)'] = apps['positive_reviews (%)'].astype(int)
+
+apps.to_csv(f"{strftime('%Y-%m-%d %H-%M-%S')}_steam_oculus.csv")
